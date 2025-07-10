@@ -1,0 +1,470 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Import des modules standard
+import json
+import logging
+import datetime
+import os
+import time
+import requests
+# sys supprimé car plus besoin
+from shapely.geometry import Point, LineString
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
+
+# Initialisation du logging avec encodage UTF-8
+log = logging.getLogger()
+LOG_LEVEL = logging.INFO
+log_file = "waze_realtime_sync.log"
+FORMAT = "%(asctime)-15s - %(levelname)s - %(message)s"
+logging.basicConfig(format=FORMAT, level=LOG_LEVEL, datefmt='%Y-%m-%d %H:%M:%S',
+                   handlers=[
+                       logging.FileHandler(log_file, encoding='utf-8'),
+                       logging.StreamHandler()
+                   ])
+
+# 1) Configuration et constantes
+API_URL = 
+
+PREDICTIONS_LAYER_TITLE = "Amir_waze_prédictions"  # Nom de la couche
+
+# Paramètres d'insertion
+MAX_BATCH_SIZE = 50  # Nombre max d'enregistrements par lot d'insertion
+
+# Date actuelle
+NOW = datetime.datetime.now()
+NOW_MS = int(time.time() * 1000)
+
+# 2) Fonctions utilitaires
+
+def format_duration(minutes):
+    """
+    Convertit une durée en minutes en un format plus lisible
+    """
+    if minutes < 60:
+        return f"{minutes} min"
+    elif minutes < 1440:  # Moins d'un jour (24*60)
+        hours = minutes // 60
+        remaining_minutes = minutes % 60
+        if remaining_minutes == 0:
+            return f"{hours} h"
+        else:
+            return f"{hours} h {remaining_minutes} min"
+    else:
+        days = minutes // 1440
+        remaining_hours = (minutes % 1440) // 60
+        if remaining_hours == 0:
+            return f"{days} j"
+        else:
+            return f"{days} j {remaining_hours} h"
+
+def get_request_with_retry(url, headers=None, params=None, nbRetry=3, waitTime=1):
+    """Effectue une requête HTTP avec retry en cas d'échec"""
+    responseCorrect = None
+    for att in range(nbRetry):
+        try:
+            response = requests.request("GET", url, headers=headers, params=params)
+            if response.status_code == 200:
+                responseJson = response.json()
+                responseCorrect = responseJson
+                break
+            else:
+                raise Exception(f"Erreur HTTP: {response.status_code}")
+        except Exception as e:
+            log.warning(f"{url} tentative {att+1}/{nbRetry}")
+            log.warning(e)
+            time.sleep(waitTime * (att + 1))
+
+    if responseCorrect is not None:             
+        return responseCorrect
+    else: 
+        raise Exception("Aucune réponse valide pour: " + url)
+
+def determine_jam_type(jam):
+    """
+    Détermine le type de jam
+    Retourne -1 pour les routes fermées (à exclure), 1 pour toutes les prédictions
+    """
+    # Route fermée (à exclure)
+    if jam.get("blockingAlertUuid"):
+        return -1  # Route fermée - à exclure
+    
+    # TOUS LES AUTRES JAMS = PRÉDICTIONS WAZE
+    return 1  # Prédiction
+
+class ArcgisHelper:
+    """Classe pour interagir avec ArcGIS"""
+    def __init__(self):
+        self.gis = GIS("home")
+        self.MAX_INSERT = MAX_BATCH_SIZE
+    
+    def getFeatureLayerByTitle(self, title):
+        """Récupère une couche par son titre"""
+        log.info(f"Recherche de la couche: {title}")
+        items = self.gis.content.search(title, item_type="Feature Layer")
+        if items:
+            log.info(f"Couche trouvée: {items[0].title}")
+            return items[0].layers[0]
+        log.warning(f"Couche {title} non trouvée")
+        return None
+    
+    def chunks(self, liste, n):
+        """Découpe une liste en chunks de taille n"""
+        n = max(1, n)
+        return (liste[i:i+n] for i in range(0, len(liste), n))
+    
+    def get_field_metadata(self, fl):
+        """Récupère les métadonnées des champs de la couche"""
+        try:
+            layer_properties = fl.properties
+            field_names = [field['name'].lower() for field in layer_properties.fields]
+            field_map = {field['name'].lower(): field['name'] for field in layer_properties.fields}
+            field_types = {field['name'].lower(): field['type'] for field in layer_properties.fields}
+            
+            objectid_field = None
+            for field in layer_properties.fields:
+                if field['type'] == 'esriFieldTypeOID':
+                    objectid_field = field['name']
+                    break
+            
+            if not objectid_field:
+                objectid_field = "objectid"
+            
+            log.info(f"Métadonnées des champs récupérées: {len(field_names)} champs")
+            
+            return {
+                'field_names': field_names,
+                'field_map': field_map,
+                'field_types': field_types,
+                'objectid_field': objectid_field
+            }
+        except Exception as e:
+            log.error(f"Erreur lors de la récupération des métadonnées: {str(e)}")
+            return None
+    
+    def clear_all_data(self, fl, metadata):
+        """Vide complètement la couche pour synchronisation temps réel"""
+        log.info("=== VIDAGE COMPLET DE LA COUCHE (SYNC TEMPS REEL) ===")
+        
+        try:
+            # Compter le nombre total d'enregistrements
+            count_result = fl.query(
+                where="1=1",
+                return_count_only=True
+            )
+            total_records = count_result
+            
+            if total_records == 0:
+                log.info("Couche déjà vide")
+                return 0
+            
+            log.info(f"{total_records} enregistrements à supprimer pour synchronisation")
+            
+            # MÉTHODE ALTERNATIVE: Supprimer par petits lots au lieu de "1=1"
+            # Pour éviter l'erreur Database error 500
+            
+            # D'abord récupérer tous les OIDs
+            all_features = fl.query(
+                where="1=1",
+                out_fields=metadata['objectid_field'],
+                return_geometry=False
+            )
+            
+            if not all_features.features or len(all_features.features) == 0:
+                log.info("Aucun enregistrement à supprimer")
+                return 0
+            
+            # Extraire les OIDs
+            object_ids = [feature.attributes[metadata['objectid_field']] for feature in all_features.features]
+            log.info(f"Suppression par lots de {len(object_ids)} enregistrements...")
+            
+            # Supprimer par lots
+            total_deleted = 0
+            for i, oid_chunk in enumerate(self.chunks(object_ids, self.MAX_INSERT)):
+                try:
+                    oid_list = ",".join(map(str, oid_chunk))
+                    delete_where = f"{metadata['objectid_field']} IN ({oid_list})"
+                    
+                    result = fl.edit_features(deletes=delete_where)
+                    
+                    if 'deleteResults' in result:
+                        deleted_count = sum(1 for res in result['deleteResults'] if res['success'])
+                        total_deleted += deleted_count
+                        log.info(f"Lot suppression {i+1}: {deleted_count}/{len(oid_chunk)} enregistrements supprimés")
+                    
+                    time.sleep(0.5)  # Pause entre les lots
+                except Exception as e:
+                    log.error(f"Erreur lors de la suppression du lot {i+1}: {str(e)}")
+            
+            log.info(f"TOTAL: {total_deleted} enregistrements supprimés avec succès")
+            return total_deleted
+                
+        except Exception as e:
+            log.error(f"Erreur lors du vidage de la couche: {str(e)}")
+            # En cas d'erreur, essayer quand même la méthode simple
+            try:
+                log.info("Tentative de suppression alternative...")
+                result = fl.edit_features(deletes="1=1")
+                log.info("Suppression alternative réussie")
+                return total_records if 'total_records' in locals() else 0
+            except Exception as e2:
+                log.error(f"Suppression alternative échouée: {str(e2)}")
+                return 0
+    
+    def insertFeatures(self, fl, features):
+        """Insère les nouvelles features (couche vidée = pas de doublons possibles)"""
+        log.info(f"Insertion de {len(features)} nouvelles features")
+        if not features or len(features) == 0: 
+            return 0
+
+        total_success = 0
+        for i, groupFeatures in enumerate(self.chunks(features, self.MAX_INSERT)):
+            try:
+                results = fl.edit_features(adds=groupFeatures)
+                
+                if 'addResults' in results:
+                    success_count = sum(1 for res in results['addResults'] if res['success'])
+                    total_success += success_count
+                    log.info(f"Lot {i+1}: {success_count}/{len(groupFeatures)} enregistrements ajoutés")
+                    
+                    error_count = sum(1 for res in results['addResults'] if not res['success'])
+                    if error_count > 0:
+                        log.warning(f"{error_count} enregistrements n'ont pas pu être ajoutés dans le lot {i+1}")
+                else:
+                    log.error(f"Résultat inattendu: {results}")
+                
+                time.sleep(1)  
+            except Exception as e:
+                log.error(f"Erreur lors de l'insertion du lot {i+1}: {str(e)}")
+        
+        return total_success
+
+# 3) Fonctions principales pour le traitement des données Waze
+
+def fetch_waze_data():
+    """Récupère les données depuis l'API Waze - Seulement les JAMs avec lignes"""
+    log.info("Récupération des données depuis l'API Waze...")
+    
+    try:
+        response = get_request_with_retry(API_URL, nbRetry=5, waitTime=1)
+        
+        # Récupérer seulement les jams (bouchons/lignes de trafic)
+        jams = response.get("jams", [])
+        log.info(f"Jams trouvés dans l'API: {len(jams)}")
+        
+        return jams
+        
+    except Exception as e:
+        log.error(f"Erreur lors de la récupération des données Waze: {str(e)}")
+        return []
+
+def process_waze_jams(jams, metadata):
+    """
+    Traite les jams Waze et les prépare pour l'insertion
+    LOGIQUE: Tous les jams disponibles dans l'API = ce qui doit être dans la couche
+    """
+    log.info("=== TRAITEMENT DES DONNÉES TEMPS RÉEL WAZE ===")
+    
+    current_timestamp = NOW_MS
+    features_to_add = []
+    
+    # Extraction des infos du metadata
+    field_names = metadata['field_names']
+    field_map = metadata['field_map']
+    field_types = metadata['field_types']
+    
+    # Statistiques
+    blocked_roads_count = 0
+    predictions_count = 0
+    no_geometry_count = 0
+    
+    for jam in jams:
+        # Déterminer le type de jam
+        jam_type_code = determine_jam_type(jam)
+        
+        # Exclure les routes barrées
+        if jam_type_code == -1:
+            blocked_roads_count += 1
+            continue
+        
+        # Extraire les coordonnées de la ligne
+        line_coordinates = jam.get("line", [])
+        if len(line_coordinates) < 2:
+            no_geometry_count += 1
+            continue  # Ignorer les lignes qui n'ont pas assez de points
+        
+        # Créer la ligne géométrique
+        try:
+            line_points = [(point["x"], point["y"]) for point in line_coordinates]
+            
+            # Géométrie ArcGIS Polyline
+            geometry = {
+                "paths": [line_points],
+                "spatialReference": {"wkid": 4326}
+            }
+            
+        except Exception as e:
+            log.warning(f"Erreur lors de la création de la géométrie: {str(e)}")
+            continue
+        
+        # Compter les prédictions (tous les jams valides)
+        predictions_count += 1
+        
+        # Extraire les données du jam
+        uuid = str(jam.get("uuid", ""))
+        if not uuid:
+            continue
+            
+        street = jam.get("street", "")
+        city = jam.get("city", "")
+        vitesse_actuelle_kmh = jam.get("speedKMH", 0)
+        niveau_jam = jam.get("level", 3)
+        delai_secondes = jam.get("delay", 0)
+        delai_format = format_duration(int(delai_secondes / 60)) if delai_secondes > 0 else "0 min"
+        longueur_metres = jam.get("length", 0)
+        
+        # Champs à adapter pour votre couche existante
+        vitesse_normale_kmh = 0  # Pas disponible dans les jams
+        ralentissement_pct = 0   # Pas calculable sans vitesse normale
+        nb_conducteurs = 1  # Toujours prédiction pour les lignes colorées Waze
+        
+        # Mapping des champs
+        field_mapping = {
+            "uuid": uuid,
+            "street": street,
+            "city": city,
+            "vitesse_actuelle_kmh": float(vitesse_actuelle_kmh),
+            "vitesse_normale_kmh": float(vitesse_normale_kmh),
+            "ralentissement_pct": float(ralentissement_pct),
+            "niveau_jam": int(niveau_jam),
+            "delai_secondes": int(delai_secondes),
+            "delai_format": delai_format,
+            "longueur_metres": float(longueur_metres),
+            "heure_prediction": current_timestamp,
+            "nb_conducteurs": int(nb_conducteurs)
+        }
+        
+        # Ne mapper que les champs qui existent réellement dans la couche
+        attributes = {}
+        for field_name, value in field_mapping.items():
+            if field_name.lower() in field_names:
+                original_field = field_map[field_name.lower()]
+                
+                # Ajuster le type selon le champ
+                field_type = field_types.get(field_name.lower())
+                if field_type == "esriFieldTypeString" and value is not None:
+                    attributes[original_field] = str(value)
+                elif field_type == "esriFieldTypeInteger" and value is not None:
+                    attributes[original_field] = int(value)
+                elif field_type == "esriFieldTypeDouble" and value is not None:
+                    attributes[original_field] = float(value)
+                elif field_type == "esriFieldTypeDate" and value is not None:
+                    if isinstance(value, (int, float)):
+                        attributes[original_field] = int(value)
+                    else:
+                        try:
+                            attributes[original_field] = int(float(value))
+                        except:
+                            attributes[original_field] = None
+                else:
+                    attributes[original_field] = value
+        
+        # Créer la feature complète avec géométrie de ligne
+        feature = {
+            "geometry": geometry,
+            "attributes": attributes
+        }
+        
+        features_to_add.append(feature)
+    
+    # Afficher les statistiques
+    log.info(f"=== STATISTIQUES SYNCHRONISATION TEMPS RÉEL ===")
+    log.info(f"Routes fermées exclues: {blocked_roads_count}")
+    log.info(f"Sans géométrie valide exclues: {no_geometry_count}")
+    log.info(f"Lignes de trafic valides: {predictions_count}")
+    log.info(f"Total à synchroniser: {len(features_to_add)}")
+    log.info(f"Horodatage: {datetime.datetime.fromtimestamp(NOW_MS/1000).strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    return features_to_add
+
+# 4) Fonction principale d'exécution
+
+def main():
+    """
+    🚨 NOUVELLE LOGIQUE: Synchronisation complète temps réel
+    1) Vider la couche
+    2) Récupérer les données API actuelles
+    3) Insérer uniquement les données actuelles
+    = La couche reflète exactement l'état de l'API à l'instant T
+    """
+    start_time = time.time()
+    log.info("====== DEMARRAGE SYNCHRONISATION TEMPS REEL WAZE ======")
+    log.info("MODE: Synchronisation complète (Vider + Recharger)")
+    
+    # Initialisation de l'helper ArcGIS
+    arcgis_helper = ArcgisHelper()
+    
+    nb_enregistrements = 0
+    
+    try:
+        # Récupération de la couche
+        predictions_layer = arcgis_helper.getFeatureLayerByTitle(PREDICTIONS_LAYER_TITLE)
+        if not predictions_layer:
+            raise Exception(f"Couche {PREDICTIONS_LAYER_TITLE} introuvable")
+        
+        # Récupération des métadonnées des champs
+        metadata = arcgis_helper.get_field_metadata(predictions_layer)
+        if not metadata:
+            raise Exception("Impossible de récupérer les métadonnées des champs")
+        
+        # ÉTAPE 1: Vider complètement la couche pour synchronisation
+        deleted_count = arcgis_helper.clear_all_data(predictions_layer, metadata)
+        log.info(f"Couche vidée: {deleted_count} enregistrements supprimés")
+        
+        # ÉTAPE 2: Récupérer les données actuelles depuis l'API Waze
+        jams = fetch_waze_data()
+        
+        if jams and len(jams) > 0:
+            # ÉTAPE 3: Traiter tous les jams disponibles dans l'API
+            features_to_add = process_waze_jams(jams, metadata)
+            
+            # ÉTAPE 4: Insérer les données actuelles
+            if features_to_add and len(features_to_add) > 0:
+                records_added = arcgis_helper.insertFeatures(predictions_layer, features_to_add)
+                log.info(f"{records_added} lignes synchronisées")
+                nb_enregistrements = records_added
+            else:
+                log.info("Aucune ligne à synchroniser")
+        else:
+            log.warning("Aucune donnée dans l'API Waze - Couche reste vide")
+        
+        # Afficher le résumé de l'exécution
+        elapsed_time = time.time() - start_time
+        minutes, seconds = divmod(elapsed_time, 60)
+        
+        log.info("====== FIN SYNCHRONISATION TEMPS REEL ======")
+        log.info(f"Durée: {int(minutes)}m {int(seconds)}s")
+        log.info(f"Anciennes données supprimées: {deleted_count}")
+        log.info(f"Nouvelles données synchronisées: {nb_enregistrements}")
+        log.info(f"RESULTAT: Ta couche = État exact de l'API Waze maintenant")
+        log.info(f"Si une ligne disparaît de Waze -> elle disparaît de ta couche")
+        log.info(f"Si une ligne apparaît dans Waze -> elle apparaît dans ta couche")
+        log.info(f"Recommandé: Exécuter toutes les 2-5 minutes pour temps réel")
+        
+    except Exception as e:
+        log.exception(f"Erreur lors de la synchronisation temps réel: {str(e)}")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+        # Suppression de sys.exit(exit_code) - le code continue maintenant
+        log.info(f"Exécution terminée avec le code: {exit_code}")
+    except Exception as e:
+        log.critical(f"Erreur non gérée: {str(e)}")
+        # Suppression de sys.exit(1) - le code continue maintenant
+        log.critical("Exécution terminée avec erreur")
